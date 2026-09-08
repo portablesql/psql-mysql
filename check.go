@@ -17,13 +17,11 @@ func checkStructureMySQL(ctx context.Context, be *psql.Backend, tv psql.TableVie
 		return nil
 	}
 
-	sb := &strings.Builder{}
-	sb.WriteString("SHOW TABLES LIKE '")
-	sb.WriteString(strings.ReplaceAll(tableName, "'", "\\'"))
-	sb.WriteString("'")
-
+	// Use information_schema with a bound parameter rather than SHOW TABLES
+	// LIKE: the LIKE pattern would need escaping of quotes (backslashes are
+	// inert under NO_BACKSLASH_ESCAPES) and of the _ and % wildcards.
 	var found bool
-	err := psql.Q(sb.String()).Each(ctx, func(rows *sql.Rows) error {
+	err := psql.Q("SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", tableName).Each(ctx, func(rows *sql.Rows) error {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return err
@@ -32,8 +30,10 @@ func checkStructureMySQL(ctx context.Context, be *psql.Backend, tv psql.TableVie
 		return nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("while checking table existence: %w", err)
 	}
+
+	sb := &strings.Builder{}
 
 	if !found {
 		return createTableMySQL(ctx, be, tv)

@@ -8,14 +8,15 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/portablesql/psql"
 	"github.com/go-sql-driver/mysql"
+	"github.com/portablesql/psql"
 )
 
 func init() {
@@ -32,8 +33,12 @@ type mysqlDialect struct{}
 
 func (mysqlDialect) Placeholder(_ int) string { return "?" }
 
-func (mysqlDialect) LimitOffset(a, b int) string {
-	return "LIMIT " + strconv.Itoa(a) + ", " + strconv.Itoa(b)
+// LimitOffset renders "LIMIT count OFFSET offset". The arguments are
+// (offset, count), matching psql's QueryBuilder.Limit(offset, count).
+//
+// Deprecated: the core renders LIMIT/OFFSET itself and no longer calls this.
+func (mysqlDialect) LimitOffset(offset, count int) string {
+	return "LIMIT " + strconv.Itoa(count) + " OFFSET " + strconv.Itoa(offset)
 }
 
 func (mysqlDialect) ExportArg(v any) any {
@@ -59,6 +64,10 @@ func (mysqlDialect) SqlType(baseType string, attrs map[string]string) string {
 	case "enum", "set":
 		if myvals, ok := attrs["values"]; ok {
 			l := strings.Split(myvals, ",")
+			for i, v := range l {
+				// NO_BACKSLASH_ESCAPES is set, so quotes are doubled
+				l[i] = strings.ReplaceAll(v, "'", "''")
+			}
 			return baseType + "('" + strings.Join(l, "','") + "')"
 		}
 		return ""
@@ -168,24 +177,34 @@ func (mysqlDialect) InsertIgnoreSQL(tableName, fldStr, placeholders string) stri
 
 // ErrorClassifier implementation
 
+// ErrorNumber returns the MySQL error number found anywhere in the error tree
+// (including joined errors), 0 for a nil error and 0xffff when no MySQL error
+// is present.
 func (mysqlDialect) ErrorNumber(err error) uint16 {
-	for {
-		if err == nil {
-			return 0
-		}
-		switch e := err.(type) {
-		case *mysql.MySQLError:
-			return e.Number
-		case interface{ Unwrap() error }:
-			err = e.Unwrap()
-		default:
-			return 0xffff
-		}
+	if err == nil {
+		return 0
 	}
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		return me.Number
+	}
+	return 0xffff
 }
 
-func (mysqlDialect) IsNotExist(err error) bool {
-	return false // handled by core via ErrorNumber
+// IsNotExist reports whether err is a MySQL error about a missing database,
+// table, column or key.
+func (d mysqlDialect) IsNotExist(err error) bool {
+	switch d.ErrorNumber(err) {
+	case 1049, // Unknown database
+		1051, // Unknown table
+		1054, // Unknown column
+		1091, // Can't DROP; check that column/key exists
+		1109, // Unknown table in ...
+		1146, // Table doesn't exist
+		1176: // Key doesn't exist in table
+		return true
+	}
+	return false
 }
 
 // DuplicateChecker implementation
@@ -203,10 +222,32 @@ func (mysqlDialect) CheckStructure(ctx context.Context, be *psql.Backend, tv psq
 // mysqlFactory implements psql.BackendFactory for MySQL DSNs.
 type mysqlFactory struct{}
 
+// MatchDSN reports whether dsn is a go-sql-driver/mysql DSN
+// ("[user[:password]@][net[(addr)]]/dbname[?param=value]"). URL-style DSNs
+// such as "postgres://..." and bare file names are rejected.
 func (mysqlFactory) MatchDSN(dsn string) bool {
-	// MySQL DSNs are the fallback — they match anything that isn't obviously PG or SQLite
+	if hasURLScheme(dsn) {
+		return false
+	}
 	_, err := mysql.ParseDSN(dsn)
 	return err == nil
+}
+
+// hasURLScheme reports whether s starts with "scheme://".
+func hasURLScheme(s string) bool {
+	i := strings.Index(s, "://")
+	if i <= 0 {
+		return false
+	}
+	for n, c := range s[:i] {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case n > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (mysqlFactory) CreateBackend(dsn string) (*psql.Backend, error) {
@@ -217,36 +258,85 @@ func (mysqlFactory) CreateBackend(dsn string) (*psql.Backend, error) {
 	return New(cfg)
 }
 
-// New creates a psql.Backend connected to a MySQL database using the given
-// mysql.Config. It sets ANSI SQL mode with NO_BACKSLASH_ESCAPES and configures
-// connection pooling.
-func New(cfg *mysql.Config) (*psql.Backend, error) {
-	cfg.Params = map[string]string{
-		"charset":  "utf8mb4",
-		"sql_mode": "'ANSI,NO_BACKSLASH_ESCAPES'",
+// DefaultCharset is the "charset" connection parameter used when the caller's
+// config does not set one.
+const DefaultCharset = "utf8mb4"
+
+// DefaultSQLMode is the "sql_mode" connection parameter used when the caller's
+// config does not set one. ANSI enables double-quoted identifiers, which psql
+// relies on, and NO_BACKSLASH_ESCAPES makes string escaping portable.
+const DefaultSQLMode = "'ANSI,NO_BACKSLASH_ESCAPES'"
+
+// mergeParams returns a copy of params with charset and sql_mode filled in
+// when absent. The caller's values are never overridden.
+func mergeParams(params map[string]string) map[string]string {
+	out := make(map[string]string, len(params)+2)
+	for k, v := range params {
+		out[k] = v
 	}
+	if _, ok := out["charset"]; !ok {
+		out["charset"] = DefaultCharset
+	}
+	if _, ok := out["sql_mode"]; !ok {
+		out["sql_mode"] = DefaultSQLMode
+	}
+	return out
+}
+
+// New creates a psql.Backend connected to a MySQL database using the given
+// mysql.Config and configures connection pooling.
+//
+// The config is not modified: a copy is used, in which cfg.Params is merged
+// with the defaults. Every parameter set by the caller (tls, parseTime, loc,
+// timeouts, ...) is kept as is; only "charset" (default [DefaultCharset]) and
+// "sql_mode" (default [DefaultSQLMode]) are added when absent.
+//
+// Note that a session sql_mode replaces the server default, so when the
+// default is used, strict mode is off for this connection even if the server
+// enables it globally. To keep strict mode, set sql_mode yourself and include
+// ANSI and NO_BACKSLASH_ESCAPES, which psql requires:
+//
+//	cfg.Params = map[string]string{
+//		"sql_mode": "'ANSI,NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES'",
+//	}
+func New(cfg *mysql.Config) (*psql.Backend, error) {
+	cfg = cfg.Clone()
+	cfg.Params = mergeParams(cfg.Params)
 
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 
-	res, err := db.Query("SHOW VARIABLES LIKE 'version%'")
-	if err != nil {
-		return nil, fmt.Errorf("SHOW VARIABLES failed: %w", err)
-	}
-
-	defer res.Close()
-	for res.Next() {
-		var k, v string
-		if err := res.Scan(&k, &v); err != nil {
-			panic(err)
-		}
-		slog.Debug(fmt.Sprintf("[mysql] %s = %s", k, v), "event", "psql:init:dbvar", "psql.dbvar", k)
+	if err := logServerVersion(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	be := psql.NewBackend(psql.EngineMySQL, db, psql.WithPoolDefaults)
 	return be, nil
+}
+
+// logServerVersion logs the server version variables at debug level. It also
+// serves as the initial connectivity check.
+func logServerVersion(db *sql.DB) error {
+	res, err := db.Query("SHOW VARIABLES LIKE 'version%'")
+	if err != nil {
+		return fmt.Errorf("SHOW VARIABLES failed: %w", err)
+	}
+	defer res.Close()
+
+	for res.Next() {
+		var k, v string
+		if err := res.Scan(&k, &v); err != nil {
+			return fmt.Errorf("SHOW VARIABLES scan failed: %w", err)
+		}
+		slog.Debug(fmt.Sprintf("[mysql] %s = %s", k, v), "event", "psql:init:dbvar", "psql.dbvar", k)
+	}
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("SHOW VARIABLES failed: %w", err)
+	}
+	return nil
 }
 
 // InitCfg creates a new MySQL Backend from the given config and sets it as psql.DefaultBackend.

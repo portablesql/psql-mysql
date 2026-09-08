@@ -7,12 +7,71 @@ on:
     branches: [master]
 
 jobs:
-  build:
-    name: Build
+  unit:
+    name: Lint and unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
-      - run: go build ./...
+          go-version: stable
+          check-latest: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "files not formatted:"; echo "$out"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -race -count=1 ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  integration:
+    name: Integration tests (psql-test, MySQL)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: psql_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: psql-mysql
+      - uses: actions/checkout@v4
+        with:
+          repository: portablesql/psql
+          path: psql
+      - uses: actions/checkout@v4
+        with:
+          repository: portablesql/psql-test
+          path: psql-test
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+      - name: Setup workspace
+        run: |
+          go work init ./psql ./psql-mysql ./psql-test
+          go work sync
+      - name: Build psql-test
+        working-directory: psql-test
+        run: go build ./...
+      - name: Run psql-test against MySQL
+        working-directory: psql-test
+        run: go test -race -count=1 ./...
+        env:
+          PSQL_TEST_DSN: "root:test@tcp(127.0.0.1:3306)/psql_test"
