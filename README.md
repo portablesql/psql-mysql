@@ -96,6 +96,26 @@ cfg.Params = map[string]string{
 
 The same works through the DSN: `...?sql_mode=%27ANSI,NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES%27`.
 
+## Product detection
+
+`New` reads `SHOW VARIABLES LIKE 'version%'` (also the initial connectivity check) and records
+`version` and `version_comment` with `psql.WithServerVersion`. When they mention MariaDB the
+backend's `Variant()` is `psql.VariantMariaDB`, otherwise `psql.VariantMySQL`. The dialect
+implements `psql.VariantAware`, so `be.Supports(...)` answers per product:
+
+| Feature | MySQL | MariaDB |
+|---------|-------|---------|
+| `FeatureAdvisoryLocks`, `FeatureCTE`, `FeatureJSON`, `FeatureFullText`, `FeatureIdentityColumns` | yes | yes |
+| `FeatureReturning` | no | yes (`INSERT`/`REPLACE` and `DELETE` only) |
+| `FeatureDistinctOn`, `FeatureListenNotify`, `FeatureAsOfSystemTime`, `FeatureRowTTL`, `FeatureVectors`, `FeatureBulkCopy` | no | no |
+
+The dialect deliberately implements neither `psql.ReturningRenderer` nor
+`psql.ReturningStatements`: a dialect has no backend and cannot tell the products apart, so the
+core decides from the detected variant, which yields exactly MariaDB's `INSERT`/`DELETE ...
+RETURNING` support and refuses `RETURNING` on MySQL with an error wrapping
+`psql.ErrNotSupported`. As a consequence `psql.Insert` never uses `RETURNING` on this engine and
+reads generated keys with `LastInsertId` on both products.
+
 ## Dialect behavior
 
 - Placeholders are `?`; `Limit(offset, count)` renders `LIMIT count OFFSET offset`.
@@ -117,13 +137,25 @@ The same works through the DSN: `...?sql_mode=%27ANSI,NO_BACKSLASH_ESCAPES,STRIC
 | `type=JSON` (magic type) | `LONGTEXT` with `format=json` |
 
 Column definitions honor `null=0/1` (`NOT NULL` / `NULL`), `default=...` (`default=\N` gives
-`DEFAULT NULL`) and `collation=...` (`COLLATE ...`).
+`DEFAULT NULL`) and `collation=...` (`COLLATE ...`). A field declared with the `autoinc`
+attribute (`ID uint64 \`sql:",key=PRIMARY,autoinc"\``) renders `AUTO_INCREMENT` after the
+nullability (a `default` attribute is dropped on such a column):
+
+```sql
+"ID" bigint(20) NOT NULL AUTO_INCREMENT
+```
 
 ### Keys and indexes
 
 All keys are created inline in `CREATE TABLE` and added with `ALTER TABLE ... ADD`:
 `PRIMARY KEY`, `UNIQUE INDEX name`, `INDEX name`, `FULLTEXT INDEX name` and
-`SPATIAL INDEX name`. `VECTOR` keys are not rendered on MySQL.
+`SPATIAL INDEX name`. `VECTOR` keys are not rendered on MySQL. `GIN` and `GIST` keys are
+PostgreSQL index methods and are skipped with a warning (`psql:check:skip_index`), in both the
+`CREATE TABLE` and the `ALTER TABLE` paths; so are keys declared with an `expression` attribute
+only (no column list), which MySQL's inline syntax cannot express.
+
+A `FULLTEXT` key on the columns searched with `psql.FullText` is required for
+`MATCH ... AGAINST` to work; the schema check creates it on new and existing tables.
 
 ### Schema check
 
@@ -134,8 +166,10 @@ in which case call `be.CheckStructure` yourself) the driver looks the table up i
 - missing table: `CREATE TABLE` with all columns and keys;
 - existing table: columns are compared with `SHOW FIELDS` and keys with `SHOW INDEX`. Columns
   whose type, nullability or default differ are `MODIFY`'d, missing columns and keys are
-  `ADD`ed in a single `ALTER TABLE`. Columns and keys that exist in the database but not in
-  the struct are logged as warnings and never dropped.
+  `ADD`ed in a single `ALTER TABLE`. An `autoinc` field whose column lacks the
+  `auto_increment` extra is `MODIFY`'d to add it; an existing `AUTO_INCREMENT` column on a field
+  without the attribute is tolerated and never downgraded. Columns and keys that exist in the
+  database but not in the struct are logged as warnings and never dropped.
 
 A table declared with `psql.Name \`sql:"name,check=0"\`` is never modified.
 
@@ -148,6 +182,25 @@ A table declared with `psql.Name \`sql:"name,check=0"\`` is never modified.
   1054 (unknown column), 1091 (can't DROP), 1109 (unknown table in ...), 1146 (table doesn't
   exist) and 1176 (key doesn't exist).
 - `psql.IsDuplicate(err)` is true for error 1062 (duplicate entry).
+- `psql.IsRetryable(err)` is true for errors 1213 (deadlock) and 1205 (lock wait timeout);
+  `psql.Tx` and `psql.TxWithOptions` retry the transaction on these.
+
+## Named locks
+
+The dialect implements `psql.LockRenderer` with `GET_LOCK` / `RELEASE_LOCK`, so
+`psql.NamedLock` and `psql.WithNamedLock` work on MySQL and MariaDB:
+
+| call | statement |
+|------|-----------|
+| acquire, timeout `0` (wait) | `SELECT GET_LOCK(?, -1)` |
+| acquire, timeout `< 0` (try) | `SELECT GET_LOCK(?, 0)` |
+| acquire, timeout `> 0` | `SELECT GET_LOCK(?, <seconds, rounded up>)` |
+| release | `SELECT RELEASE_LOCK(?)` |
+
+`GET_LOCK` returns 1 on success and 0 when the wait times out (`psql.ErrLockTimeout`); `NULL`
+(an error) is reported as a query error. Locks belong to the session, survive transactions and
+are re-entrant on the same connection; `psql.NamedLock` therefore pins a connection until
+`release` is called.
 
 ## Testing
 

@@ -92,6 +92,12 @@ func checkStructureMySQL(ctx context.Context, be *psql.Backend, tv psql.TableVie
 		if err != nil {
 			return fmt.Errorf("field %s.%s fails check: %w", tv.TableName(), fi.Field, err)
 		}
+		if ok && f.IsAutoInc() && !strings.Contains(strings.ToLower(fi.Extra), "auto_increment") {
+			// the struct declares autoinc but the column is not
+			// AUTO_INCREMENT yet (the reverse is tolerated: an existing
+			// AUTO_INCREMENT column is never downgraded)
+			ok = false
+		}
 		if !ok {
 			alterData = append(alterData, "MODIFY "+f.DefString(be))
 		}
@@ -229,12 +235,10 @@ func createTableSQL(be *psql.Backend, tv psql.TableView) (string, error) {
 	}
 
 	for _, k := range tv.AllKeys() {
-		if len(k.Fields) == 0 {
-			continue
-		}
 		def := k.DefString(be)
 		if def == "" {
-			// key types MySQL cannot express inline (e.g. VECTOR) are skipped
+			// key types MySQL cannot express inline (VECTOR, GIN/GiST,
+			// expression keys) are skipped, see inlineKeyDef
 			continue
 		}
 		sb.WriteString(", ")
