@@ -97,7 +97,11 @@ func checkStructureMySQL(ctx context.Context, be *psql.Backend, tv psql.TableVie
 		}
 	}
 	for _, f := range flds {
-		alterData = append(alterData, "ADD "+f.DefString(be))
+		def := f.DefString(be)
+		if def == "" {
+			return fmt.Errorf("field %s.%s has no SQL type: add a type= or import= tag attribute", tv.TableName(), f.Name)
+		}
+		alterData = append(alterData, "ADD "+def)
 	}
 
 	// index keys by name
@@ -168,7 +172,9 @@ func checkStructureMySQL(ctx context.Context, be *psql.Backend, tv psql.TableVie
 		slog.Warn(fmt.Sprintf("[psql:check] key %s.%s missing in structure", tv.TableName(), keyname), "event", "psql:check:unused_key", "psql.table", tv.TableName(), "psql.key", keyname)
 	}
 	for _, k := range keys {
-		alterData = append(alterData, "ADD "+k.DefString(be))
+		if def := k.DefString(be); def != "" {
+			alterData = append(alterData, "ADD "+def)
+		}
 	}
 
 	if len(alterData) > 0 {
@@ -192,6 +198,18 @@ func checkStructureMySQL(ctx context.Context, be *psql.Backend, tv psql.TableVie
 }
 
 func createTableMySQL(ctx context.Context, be *psql.Backend, tv psql.TableView) error {
+	stmt, err := createTableSQL(be, tv)
+	if err != nil {
+		return err
+	}
+	if err := psql.Q(stmt).Exec(ctx); err != nil {
+		return fmt.Errorf("while creating structure: %w", err)
+	}
+	return nil
+}
+
+// createTableSQL renders the CREATE TABLE statement for tv.
+func createTableSQL(be *psql.Backend, tv psql.TableView) (string, error) {
 	tableName := tv.FormattedName(be)
 
 	sb := &strings.Builder{}
@@ -200,25 +218,30 @@ func createTableMySQL(ctx context.Context, be *psql.Backend, tv psql.TableView) 
 	sb.WriteString(" (")
 
 	for n, f := range tv.AllFields() {
+		def := f.DefString(be)
+		if def == "" {
+			return "", fmt.Errorf("field %s.%s has no SQL type: add a type= or import= tag attribute", tv.TableName(), f.Name)
+		}
 		if n > 0 {
 			sb.WriteString(", ")
 		}
-		sb.WriteString(f.DefString(be))
+		sb.WriteString(def)
 	}
 
 	for _, k := range tv.AllKeys() {
 		if len(k.Fields) == 0 {
 			continue
 		}
+		def := k.DefString(be)
+		if def == "" {
+			// key types MySQL cannot express inline (e.g. VECTOR) are skipped
+			continue
+		}
 		sb.WriteString(", ")
-		sb.WriteString(k.DefString(be))
+		sb.WriteString(def)
 	}
 
 	sb.WriteByte(')')
 
-	if err := psql.Q(sb.String()).Exec(ctx); err != nil {
-		return fmt.Errorf("while creating structure: %w", err)
-	}
-
-	return nil
+	return sb.String(), nil
 }
