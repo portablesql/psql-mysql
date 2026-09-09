@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/go-sql-driver/mysql v1.9.1
-	github.com/portablesql/psql v0.5.10-0.20260909013314-13df57038114
+	github.com/portablesql/psql v0.5.10
 )
 
 require (
