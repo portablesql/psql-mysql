@@ -10,8 +10,8 @@ github.com/go-sql-driver/mysql v1.9.1 h1:FrjNGn/BsJQjVRuSa8CBrM5BWA9BWoXXat3KrtS
 github.com/go-sql-driver/mysql v1.9.1/go.mod h1:qn46aNg1333BRMNU69Lq93t8du/dwxI64Gl8i5p1WMU=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/portablesql/psql v0.5.0 h1:pNBxh09nW+Vg94Q1BEn2cGUkogTDZMpsNT/pBo8OTxk=
-github.com/portablesql/psql v0.5.0/go.mod h1:E66N5+asL6D6RL0xbNoBQWGrfuRiVrGBPAQvOkeQV6k=
+github.com/portablesql/psql v0.5.9 h1:iKaSSKl87NaZwcLwCeIipFaWA4HBzSbyaSUVPNomXxw=
+github.com/portablesql/psql v0.5.9/go.mod h1:E66N5+asL6D6RL0xbNoBQWGrfuRiVrGBPAQvOkeQV6k=
 github.com/stretchr/testify v1.8.1 h1:w7B6lhMri9wdJUVmEZPGGhZzrYTPvgJArz7wNPgYKsk=
 github.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o6fzry7u4=
 golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 h1:mgKeJMpvi0yx/sU5GsxQ7p6s2wtOnGAHZWCHUM4KGzY=
